@@ -1,13 +1,16 @@
 """
-Speaker Detection with Vector Database (ChromaDB)
-==================================================
-Uses ChromaDB for efficient similarity search and persistent storage.
+Speaker Detection with Multi-Feature Fusion and Vector Database (ChromaDB)
+===========================================================================
+Uses ChromaDB for efficient similarity search and persistent storage, with
+multi-feature fusion scoring (NN embeddings + FFT + MFCC) for higher accuracy.
 
-Benefits:
-- Fast nearest-neighbor search for speaker matching
-- Persistent storage (survives restarts)
-- Scalable to thousands of speaker profiles
-- Built-in cosine similarity search
+Key features:
+- Multi-feature fusion: combines neural network, FFT, and MFCC similarity scores
+- Persistent storage: both embeddings (ChromaDB) and spectral features (disk)
+- Audio quality gating: rejects low-SNR segments before identification
+- Per-speaker temporal smoothing: avoids cross-speaker confidence bleed
+- Enrollment quality checks: consistency validation and minimum sample count
+- High-confidence centroid updates: prevents profile drift from misidentifications
 """
 
 import numpy as np
@@ -18,6 +21,7 @@ from datetime import datetime
 import time
 import warnings
 import os
+import json
 import shutil
 from pathlib import Path
 from typing import Optional, Dict, Tuple, List
@@ -61,7 +65,14 @@ class VectorDBSpeakerDetector:
         confidence_smoothing=0.4,       # Temporal smoothing factor
         switch_confirmation_count=2,    # Require N consecutive detections before confirming switch
         use_fft=True,                   # Use FFT spectral features
-        fft_weight=0.2                  # Weight for FFT features (0-1)
+        fft_weight=0.2,                 # Weight for FFT features in fusion scoring
+        nn_weight=0.60,                 # Weight for neural network embedding score
+        spectral_fft_weight=0.20,       # Weight for FFT spectral score in fusion
+        spectral_mfcc_weight=0.20,      # Weight for MFCC spectral score in fusion
+        min_audio_energy=0.005,         # Minimum RMS energy to accept audio segment
+        min_snr_db=5.0,                 # Minimum signal-to-noise ratio in dB
+        centroid_update_threshold=0.55, # Only update centroid if confidence above this
+        min_enrollment_samples=3        # Minimum samples required for enrollment
     ):
         self.sample_rate = sample_rate
         self.similarity_threshold = similarity_threshold
@@ -75,26 +86,42 @@ class VectorDBSpeakerDetector:
         self.switch_confirmation_count = switch_confirmation_count
         self.use_fft = use_fft
         self.fft_weight = fft_weight
-        
-        # Temporal smoothing - track recent confidences
-        self.recent_confidences = []
-        self.max_recent = 5  # Number of recent detections to average
-        
+
+        # Multi-feature fusion weights (must sum to 1.0)
+        self.nn_weight = nn_weight
+        self.spectral_fft_weight = spectral_fft_weight
+        self.spectral_mfcc_weight = spectral_mfcc_weight
+
+        # Audio quality thresholds
+        self.min_audio_energy = min_audio_energy
+        self.min_snr_db = min_snr_db
+
+        # Centroid update controls
+        self.centroid_update_threshold = centroid_update_threshold
+
+        # Enrollment quality
+        self.min_enrollment_samples = min_enrollment_samples
+
+        # Per-speaker temporal smoothing - track recent confidences per speaker
+        self.per_speaker_confidences = {}  # {speaker_id: deque of recent confidences}
+        self.max_recent = 5  # Number of recent detections to average per speaker
+
         # Speaker switch confirmation - prevents rapid flip-flopping
         self.pending_speaker = None      # Speaker waiting to be confirmed
         self.pending_count = 0           # How many times pending speaker detected
         self.confirmed_speaker = None    # Currently confirmed speaker
         
         # Initialize ChromaDB
+        self.db_path = db_path
         print("Initializing ChromaDB vector database...")
         self.chroma_client = chromadb.PersistentClient(path=db_path)
-        
+
         # Create or get collection for speaker embeddings
         self.collection = self.chroma_client.get_or_create_collection(
             name="speaker_embeddings",
             metadata={"hnsw:space": "cosine"}  # Use cosine similarity
         )
-        
+
         print(f"[*] Loaded {self.collection.count()} embeddings from database")
         
         # Initialize VAD
@@ -132,9 +159,8 @@ class VectorDBSpeakerDetector:
         self._vad_buffer = np.array([], dtype=np.float32)
         
         # Recent detections for switch confirmation
-        self.recent_detections = []  # List of (speaker_id, confidence) tuples
-        self.max_recent_detections = 5
-        
+        self.recent_detections = deque(maxlen=5)
+
         # Enrollment
         self.enrollment_mode = False
         self.enrollment_target = None
@@ -142,10 +168,12 @@ class VectorDBSpeakerDetector:
         self.enrollment_fft_features = []  # Store FFT features during enrollment
         self.enrollment_mfcc_features = []  # Store MFCC features during enrollment
         self.enrollment_min_duration = 5.0  # Longer samples for enrollment (5 seconds)
-        
-        # Spectral features storage (separate from vector DB)
+
+        # Spectral features storage - persisted to disk alongside ChromaDB
+        self.spectral_features_path = os.path.join(db_path, 'spectral_features.json')
         self.speaker_fft_features = {}   # {speaker_id: fft_centroid}
         self.speaker_mfcc_features = {}  # {speaker_id: mfcc_centroid}
+        self._load_spectral_features()
 
         self.last_enrollment_time = 0       # Timestamp of last enrollment sample
     
@@ -166,6 +194,66 @@ class VectorDBSpeakerDetector:
                     pass
         return max_id
     
+    def _load_spectral_features(self):
+        """Load persisted FFT/MFCC features from disk."""
+        if os.path.exists(self.spectral_features_path):
+            try:
+                with open(self.spectral_features_path, 'r') as f:
+                    data = json.load(f)
+                for sid, feat in data.get('fft', {}).items():
+                    self.speaker_fft_features[sid] = np.array(feat, dtype=np.float32)
+                for sid, feat in data.get('mfcc', {}).items():
+                    self.speaker_mfcc_features[sid] = np.array(feat, dtype=np.float32)
+                print(f"[*] Loaded spectral features for {len(self.speaker_fft_features)} speakers")
+            except (json.JSONDecodeError, KeyError) as e:
+                print(f"[!] Could not load spectral features: {e}")
+
+    def _save_spectral_features(self):
+        """Persist FFT/MFCC features to disk."""
+        data = {
+            'fft': {sid: feat.tolist() for sid, feat in self.speaker_fft_features.items()},
+            'mfcc': {sid: feat.tolist() for sid, feat in self.speaker_mfcc_features.items()}
+        }
+        os.makedirs(os.path.dirname(self.spectral_features_path), exist_ok=True)
+        with open(self.spectral_features_path, 'w') as f:
+            json.dump(data, f)
+
+    def check_audio_quality(self, audio_data: np.ndarray) -> Tuple[bool, float, float]:
+        """
+        Check if audio segment has sufficient quality for reliable embedding extraction.
+        Returns (is_acceptable, rms_energy, snr_db).
+        """
+        audio = audio_data.astype(np.float32)
+
+        # RMS energy
+        rms = np.sqrt(np.mean(audio ** 2))
+
+        # Estimate SNR: compare top 90th percentile energy to bottom 10th percentile
+        frame_size = 512
+        num_frames = len(audio) // frame_size
+        if num_frames < 2:
+            return rms >= self.min_audio_energy, rms, 0.0
+
+        frame_energies = np.array([
+            np.sqrt(np.mean(audio[i * frame_size:(i + 1) * frame_size] ** 2))
+            for i in range(num_frames)
+        ])
+        signal_energy = np.percentile(frame_energies, 90)
+        noise_energy = np.percentile(frame_energies, 10) + 1e-10
+        snr_db = 20 * np.log10(signal_energy / noise_energy)
+
+        is_acceptable = rms >= self.min_audio_energy and snr_db >= self.min_snr_db
+        return is_acceptable, rms, snr_db
+
+    def _reset_session_state(self):
+        """Reset temporal state between listening sessions to prevent stale data leakage."""
+        self.per_speaker_confidences.clear()
+        self.pending_speaker = None
+        self.pending_count = 0
+        self.confirmed_speaker = None
+        self.recent_detections.clear()
+        self.last_speaker_id = None
+
     def preprocess_audio(self, audio_data: np.ndarray) -> np.ndarray:
         """
         Preprocess audio for better embedding quality.
@@ -563,89 +651,119 @@ class VectorDBSpeakerDetector:
             metadatas=[main_metadata]
         )
     
-    def identify_speaker(self, embedding: np.ndarray) -> Tuple[str, float]:
+    def identify_speaker(self, embedding: np.ndarray, audio_data: np.ndarray = None) -> Tuple[str, float]:
         """
-        Identify speaker using vector database similarity search.
-        Returns 'Unknown' if no matching enrolled speaker found.
-        Uses temporal smoothing for more stable detection.
-        
-        Enhanced unknown detection:
-        - Requires minimum absolute similarity (0.40) regardless of bonuses
-        - Requires similarity to be meaningfully above baseline (random similarity ~0.15-0.25)
-        - Only enrolled speakers get bonus, and must still meet raw threshold
+        Identify speaker using multi-feature fusion scoring.
+
+        Combines neural network embedding similarity with FFT and MFCC spectral
+        similarity for higher accuracy. Uses per-speaker temporal smoothing to
+        avoid cross-speaker confidence bleed.
+
+        Args:
+            embedding: Neural network embedding vector
+            audio_data: Raw audio data (used for FFT/MFCC scoring when available)
+
+        Returns:
+            (speaker_id, fused_confidence) or ("Unknown", raw_nn_similarity)
         """
-        
-        speaker_id, similarity, is_enrolled = self.find_similar_speaker(embedding)
-        
-        if speaker_id is None:
-            # No speakers in database
+        # Single DB query - reuse for both top match and distinctiveness
+        all_matches = self.find_all_speaker_similarities(embedding)
+
+        if not all_matches:
             return "Unknown", 0.0
-        
+
+        speaker_id = all_matches[0][0]
+        similarity = all_matches[0][1]
+        is_enrolled = all_matches[0][2]
+
         # ===== STRICT UNKNOWN DETECTION =====
-        # Minimum absolute similarity before ANY match is allowed
-        # Random embeddings typically have 0.15-0.30 cosine similarity
-        # Real matches should be significantly higher
-        min_absolute_similarity = 0.40  # Hard floor - below this is definitely unknown
+        min_absolute_similarity = 0.40  # Hard floor
         baseline_similarity = 0.25      # Expected random similarity
-        required_gap = 0.10             # How much above baseline we need
-        
-        # If raw similarity is below absolute minimum, definitely unknown
+        required_gap = 0.10             # Required gap above baseline
+
         if similarity < min_absolute_similarity:
-            # Clear recent confidences to avoid smoothing affecting next detection
-            if len(self.recent_confidences) > 2:
-                self.recent_confidences = self.recent_confidences[-2:]
             return "Unknown", similarity
-        
-        # If similarity isn't meaningfully above baseline, likely unknown
+
         if similarity < (baseline_similarity + required_gap):
             return "Unknown", similarity
-        
+
         # ===== DISTINCTIVENESS CHECK =====
-        # If top match isn't significantly better than second match,
-        # the speaker identity might be ambiguous - but allow if high confidence
-        all_matches = self.find_all_speaker_similarities(embedding)
         if len(all_matches) >= 2:
-            top_sim = all_matches[0][1]  # Best match similarity
-            second_sim = all_matches[1][1]  # Second best
-            distinctiveness_gap = 0.05  # Require 5% gap between 1st and 2nd
-            high_confidence_threshold = 0.50  # If above this, accept even with small gap
-            
-            # Allow if high confidence OR if gap is sufficient
+            top_sim = all_matches[0][1]
+            second_sim = all_matches[1][1]
+            distinctiveness_gap = 0.05
+            high_confidence_threshold = 0.50
+
             if top_sim < high_confidence_threshold and (top_sim - second_sim) < distinctiveness_gap:
-                # Low confidence AND ambiguous - all speakers are too similar
-                if len(self.recent_confidences) > 2:
-                    self.recent_confidences = self.recent_confidences[-2:]
                 return "Unknown", similarity
-        
-        # ===== THRESHOLD-BASED MATCHING =====
-        # Apply enrollment bonus for enrolled speakers (uses configurable bonus)
-        effective_similarity = similarity + (self.enrollment_bonus if is_enrolled else 0)
+
+        # ===== MULTI-FEATURE FUSION SCORING =====
+        # Start with NN similarity as the base score
+        nn_score = similarity
+
+        # Compute spectral scores if audio_data provided and features available
+        fft_score = 0.0
+        mfcc_score = 0.0
+        has_fft = self.use_fft and audio_data is not None and speaker_id in self.speaker_fft_features
+        has_mfcc = self.use_fft and audio_data is not None and speaker_id in self.speaker_mfcc_features
+
+        if has_fft:
+            fft_score = self.compute_fft_similarity(audio_data, speaker_id)
+        if has_mfcc:
+            mfcc_score = self.compute_mfcc_similarity(audio_data, speaker_id)
+
+        # Compute fused score with adaptive weighting
+        if has_fft and has_mfcc:
+            # Full fusion: NN + FFT + MFCC
+            fused_score = (
+                self.nn_weight * nn_score +
+                self.spectral_fft_weight * fft_score +
+                self.spectral_mfcc_weight * mfcc_score
+            )
+        elif has_fft:
+            # Partial: NN + FFT only, redistribute MFCC weight
+            fused_score = (
+                (self.nn_weight + self.spectral_mfcc_weight * 0.5) * nn_score +
+                (self.spectral_fft_weight + self.spectral_mfcc_weight * 0.5) * fft_score
+            )
+        elif has_mfcc:
+            # Partial: NN + MFCC only, redistribute FFT weight
+            fused_score = (
+                (self.nn_weight + self.spectral_fft_weight * 0.5) * nn_score +
+                (self.spectral_mfcc_weight + self.spectral_fft_weight * 0.5) * mfcc_score
+            )
+        else:
+            # NN only
+            fused_score = nn_score
+
+        # Apply enrollment bonus
+        effective_similarity = fused_score + (self.enrollment_bonus if is_enrolled else 0)
         threshold = self.enrolled_threshold if is_enrolled else self.similarity_threshold
-        
-        # Apply temporal smoothing - average with recent confidences
-        if self.recent_confidences:
+
+        # ===== PER-SPEAKER TEMPORAL SMOOTHING =====
+        # Only smooth with history from the SAME speaker to avoid cross-speaker bleed
+        if speaker_id not in self.per_speaker_confidences:
+            self.per_speaker_confidences[speaker_id] = deque(maxlen=self.max_recent)
+
+        speaker_history = self.per_speaker_confidences[speaker_id]
+        if speaker_history:
             smoothed_similarity = (
-                effective_similarity * (1 - self.confidence_smoothing) + 
-                np.mean(self.recent_confidences) * self.confidence_smoothing
+                effective_similarity * (1 - self.confidence_smoothing) +
+                np.mean(speaker_history) * self.confidence_smoothing
             )
         else:
             smoothed_similarity = effective_similarity
-        
-        # Track recent confidence for smoothing
-        self.recent_confidences.append(effective_similarity)
-        if len(self.recent_confidences) > self.max_recent:
-            self.recent_confidences.pop(0)
-        
+
+        # Track this confidence for this speaker
+        speaker_history.append(effective_similarity)
+
         # Must meet BOTH the threshold AND the min_raw_similarity
         if smoothed_similarity >= threshold and similarity >= self.min_raw_similarity:
-            # Match found - update centroid
-            self.update_speaker_centroid(speaker_id, embedding)
+            # Only update centroid when confidence is high enough to avoid drift
+            if smoothed_similarity >= self.centroid_update_threshold:
+                self.update_speaker_centroid(speaker_id, embedding)
             return speaker_id, smoothed_similarity
         else:
-            # No match - return Unknown (don't create new speaker)
-            # Clear some smoothing history when unknown to prevent drift
-            if len(self.recent_confidences) > 2:
-                self.recent_confidences = self.recent_confidences[-2:]
             return "Unknown", similarity
     
     def compute_fft_similarity(self, audio_data: np.ndarray, speaker_id: str) -> float:
@@ -694,37 +812,65 @@ class VectorDBSpeakerDetector:
         self.enrollment_mfcc_features = []  # Reset MFCC features collection
     
     def complete_enrollment(self) -> bool:
-        """Complete enrollment and save to vector database."""
+        """Complete enrollment and save to vector database with quality checks."""
         if not self.enrollment_embeddings:
             print("[!] No embeddings collected. Enrollment failed.")
             self.enrollment_mode = False
             return False
-        
+
+        if len(self.enrollment_embeddings) < self.min_enrollment_samples:
+            print(f"[!] Only {len(self.enrollment_embeddings)} samples collected, "
+                  f"need at least {self.min_enrollment_samples}. Enrollment failed.")
+            print("[!] Try speaking longer and more clearly.")
+            self.enrollment_mode = False
+            return False
+
+        # Check embedding consistency - reject if samples are too spread out
+        embeddings_array = np.array(self.enrollment_embeddings)
+        centroid = np.mean(embeddings_array, axis=0)
+        centroid = centroid / np.linalg.norm(centroid)
+        similarities = np.dot(embeddings_array, centroid)
+        avg_consistency = np.mean(similarities)
+
+        if avg_consistency < 0.80:
+            print(f"[!] Low enrollment consistency ({avg_consistency:.2f}). "
+                  "Too much noise or multiple speakers detected.")
+            print("[!] Try enrolling in a quieter environment with only one speaker.")
+            self.enrollment_mode = False
+            return False
+
         # Create centroid from collected embeddings
-        mean_embedding = np.mean(self.enrollment_embeddings, axis=0)
-        mean_embedding = mean_embedding / np.linalg.norm(mean_embedding)
-        
+        mean_embedding = centroid
+
         # Add to database as enrolled speaker
         self.add_speaker_embedding(self.enrollment_target, mean_embedding, is_enrolled=True)
-        
+
         # Save FFT features centroid if collected
-        if self.use_fft and self.enrollment_fft_features:
+        if self.enrollment_fft_features:
             fft_centroid = np.mean(self.enrollment_fft_features, axis=0)
-            fft_centroid = fft_centroid / np.linalg.norm(fft_centroid)
+            norm = np.linalg.norm(fft_centroid)
+            if norm > 0:
+                fft_centroid = fft_centroid / norm
             self.speaker_fft_features[self.enrollment_target] = fft_centroid
             print(f"    FFT features saved: {len(self.enrollment_fft_features)} samples")
-        
+
         # Save MFCC features centroid if collected
-        if self.use_fft and self.enrollment_mfcc_features:
+        if self.enrollment_mfcc_features:
             mfcc_centroid = np.mean(self.enrollment_mfcc_features, axis=0)
-            mfcc_centroid = mfcc_centroid / np.linalg.norm(mfcc_centroid)
+            norm = np.linalg.norm(mfcc_centroid)
+            if norm > 0:
+                mfcc_centroid = mfcc_centroid / norm
             self.speaker_mfcc_features[self.enrollment_target] = mfcc_centroid
             print(f"    MFCC features saved: {len(self.enrollment_mfcc_features)} samples")
-        
+
+        # Persist spectral features to disk
+        self._save_spectral_features()
+
         print(f"\n[+] Enrollment complete: {self.enrollment_target}")
         print(f"    Collected {len(self.enrollment_embeddings)} embeddings")
+        print(f"    Consistency: {avg_consistency:.2f}")
         print(f"    Total embeddings in database: {self.collection.count()}")
-        
+
         self.enrollment_mode = False
         self.enrollment_target = None
         self.enrollment_embeddings = []
@@ -740,10 +886,8 @@ class VectorDBSpeakerDetector:
         This prevents rapid flip-flopping between speakers by requiring
         multiple consecutive detections of a new speaker before confirming.
         """
-        # Track this detection
+        # Track this detection (deque maxlen handles overflow automatically)
         self.recent_detections.append((detected_speaker, confidence))
-        if len(self.recent_detections) > self.max_recent_detections:
-            self.recent_detections.pop(0)
         
         # First detection ever - confirm immediately
         if self.confirmed_speaker is None:
@@ -810,23 +954,30 @@ class VectorDBSpeakerDetector:
                 speech_duration = len(self.speech_buffer) * 512 / self.sample_rate
                 if speech_duration >= self.min_speech_duration:
                     speech_audio = np.concatenate(list(self.speech_buffer))
-                    
+
                     try:
+                        # Audio quality gate - reject low-quality segments
+                        is_quality, rms, snr = self.check_audio_quality(speech_audio)
+                        if not is_quality:
+                            # Skip this segment silently - too noisy or too quiet
+                            if not self.enrollment_mode:
+                                self.speech_buffer.clear()
+                            continue
+
                         embedding = self.get_embedding(speech_audio)
-                        
+
                         if self.enrollment_mode:
                             # Show enrollment progress
-                            print(f"\r[Enrolling] Speech: {speech_duration:.1f}s / {self.enrollment_min_duration:.1f}s required", end="", flush=True)
-                            
+                            print(f"\r[Enrolling] Speech: {speech_duration:.1f}s / {self.enrollment_min_duration:.1f}s required | SNR: {snr:.1f}dB", end="", flush=True)
+
                             # Only collect if enough audio duration
                             if speech_duration >= self.enrollment_min_duration:
                                 self.enrollment_embeddings.append(embedding)
-                                # Also collect FFT and MFCC features if enabled
-                                if self.use_fft:
-                                    fft_features = self.extract_fft_features(speech_audio)
-                                    self.enrollment_fft_features.append(fft_features)
-                                    mfcc_features = self.extract_mfcc_features(speech_audio)
-                                    self.enrollment_mfcc_features.append(mfcc_features)
+                                # Always collect FFT and MFCC features during enrollment for persistence
+                                fft_features = self.extract_fft_features(speech_audio)
+                                self.enrollment_fft_features.append(fft_features)
+                                mfcc_features = self.extract_mfcc_features(speech_audio)
+                                self.enrollment_mfcc_features.append(mfcc_features)
                                 result = {
                                     'mode': 'enrollment',
                                     'speaker_id': self.enrollment_target,
@@ -836,56 +987,58 @@ class VectorDBSpeakerDetector:
                                 print()  # New line after collecting
                                 self.speech_buffer.clear()  # Clear buffer after collecting
                         else:
-                            # Get raw detection
-                            raw_speaker_id, raw_confidence = self.identify_speaker(embedding)
-                            
+                            # Identify speaker with multi-feature fusion
+                            raw_speaker_id, raw_confidence = self.identify_speaker(
+                                embedding, audio_data=speech_audio
+                            )
+
                             # Apply speaker switch confirmation
                             confirmed_speaker, confidence, is_confirmed_switch = self._confirm_speaker_switch(
                                 raw_speaker_id, raw_confidence
                             )
-                            
+
                             # Only report as speaker_changed if it's a CONFIRMED switch
                             speaker_changed = is_confirmed_switch
-                            
+
                             # Use confirmed speaker for output (prevents showing rapid changes)
                             output_speaker = self.confirmed_speaker if self.confirmed_speaker else raw_speaker_id
-                            
+
                             # But if pending is building up, show the raw detection to indicate potential change
                             if self.pending_count > 0 and self.pending_speaker:
-                                # Show intermediate detection but not as confirmed change
                                 output_speaker = raw_speaker_id
-                            
-                            # Get all speaker similarities for debugging
+
+                            # Get all speaker similarities for debug display
+                            # (reuse embedding - no extra DB query needed since identify_speaker already queried)
                             all_similarities = self.find_all_speaker_similarities(embedding)
-                            
-                            # Compute FFT and MFCC similarity if enabled and speaker is known
+
+                            # Compute FFT and MFCC similarity for display
                             fft_similarity = 0.0
                             mfcc_similarity = 0.0
                             if self.use_fft and output_speaker != "Unknown":
                                 fft_similarity = self.compute_fft_similarity(speech_audio, output_speaker)
                                 mfcc_similarity = self.compute_mfcc_similarity(speech_audio, output_speaker)
-                            
+
                             result = {
                                 'mode': 'detection',
                                 'speaker_id': output_speaker,
                                 'confidence': confidence,
-                                'fft_similarity': fft_similarity,    # FFT-based similarity
-                                'mfcc_similarity': mfcc_similarity,  # MFCC-based similarity
+                                'fft_similarity': fft_similarity,
+                                'mfcc_similarity': mfcc_similarity,
                                 'speaker_changed': speaker_changed,
                                 'timestamp': datetime.now(),
                                 'duration': len(speech_audio) / self.sample_rate,
                                 'db_size': self.collection.count(),
                                 'pending_switch': self.pending_speaker if self.pending_count > 0 else None,
-                                'all_similarities': all_similarities  # Debug: show all matches
+                                'all_similarities': all_similarities
                             }
-                            
+
                             self.last_speaker_id = output_speaker
-                        
+
                             # Clear buffer after detection (not enrollment - that clears on success)
                             self.speech_buffer.clear()
-                        
+
                     except Exception as e:
-                        print(f"[ERROR] {e}")
+                        print(f"[ERROR] {type(e).__name__}: {e}")
                         if not self.enrollment_mode:
                             self.speech_buffer.clear()
             else:
@@ -899,7 +1052,9 @@ class VectorDBSpeakerDetector:
     
     def start_listening(self, duration=None, enrollment_speaker=None):
         """Start real-time audio capture."""
-        
+        # Reset temporal state to prevent stale data from previous sessions
+        self._reset_session_state()
+
         if enrollment_speaker:
             self.start_enrollment(enrollment_speaker)
         
@@ -1010,13 +1165,13 @@ class VectorDBSpeakerDetector:
     def record_and_identify(self, duration: float = 5.0):
         """
         Record audio for a fixed duration and identify the speaker.
-        This is simpler and often more accurate than continuous detection.
+        Uses multi-feature fusion for higher accuracy than continuous detection.
         """
         print(f"\n{'='*70}")
         print(f"RECORDING {duration} SECONDS OF AUDIO...")
         print(f"{'='*70}")
         print("Speak now!")
-        
+
         # Record audio
         audio_data = sd.rec(
             int(duration * self.sample_rate),
@@ -1025,65 +1180,95 @@ class VectorDBSpeakerDetector:
             dtype='float32'
         )
         sd.wait()  # Wait for recording to complete
-        
+
         print("\nRecording complete! Analyzing...")
-        
+
         # Flatten to 1D
         audio_data = audio_data.flatten()
-        
-        # Extract embedding (uses FFT features if enabled)
+
+        # Check audio quality
+        is_quality, rms, snr = self.check_audio_quality(audio_data)
+        print(f"  Audio quality - RMS: {rms:.4f}, SNR: {snr:.1f}dB {'(OK)' if is_quality else '(LOW)'}")
+
+        if not is_quality:
+            print("[!] Audio quality too low for reliable identification.")
+            print("    Try speaking louder or reducing background noise.")
+            return
+
+        # Extract embedding
         embedding = self.get_embedding(audio_data)
-        
+
         # Get all speaker similarities
         all_matches = self.find_all_speaker_similarities(embedding)
-        
-        # Identify speaker
-        speaker_id, confidence = self.identify_speaker(embedding)
-        
+
+        # Identify speaker with multi-feature fusion
+        speaker_id, confidence = self.identify_speaker(embedding, audio_data=audio_data)
+
         # Display results
         print(f"\n{'='*70}")
         print("RESULT")
         print(f"{'='*70}")
         print(f"\n  Detected Speaker: {speaker_id}")
-        print(f"  Confidence: {confidence * 100:.1f}%")
-        
-        print(f"\n  All Similarity Scores:")
+        print(f"  Fused Confidence: {confidence * 100:.1f}%")
+
+        # Show spectral similarity breakdown
+        if speaker_id != "Unknown" and self.use_fft:
+            fft_sim = self.compute_fft_similarity(audio_data, speaker_id)
+            mfcc_sim = self.compute_mfcc_similarity(audio_data, speaker_id)
+            print(f"  NN Similarity:   {all_matches[0][1] * 100:.1f}%" if all_matches else "")
+            print(f"  FFT Similarity:  {fft_sim * 100:.1f}%")
+            print(f"  MFCC Similarity: {mfcc_sim * 100:.1f}%")
+
+        print(f"\n  All NN Similarity Scores:")
         for i, (sid, sim, enrolled) in enumerate(all_matches):
             enrolled_tag = " [enrolled]" if enrolled else ""
             marker = " <-- BEST MATCH" if i == 0 else ""
             print(f"    {i+1}. {sid}: {sim*100:.1f}%{enrolled_tag}{marker}")
-        
+
         print(f"\n{'='*70}")
 
     def reset_database(self):
-        """Delete all speaker data from the database."""
+        """Delete all speaker data from the database and persisted spectral features."""
         self.chroma_client.delete_collection("speaker_embeddings")
         self.collection = self.chroma_client.create_collection(
             name="speaker_embeddings",
             metadata={"hnsw:space": "cosine"}
         )
         self.speaker_count = 0
-        print("[*] Database reset complete")
+        self.speaker_fft_features.clear()
+        self.speaker_mfcc_features.clear()
+        if os.path.exists(self.spectral_features_path):
+            os.remove(self.spectral_features_path)
+        self._reset_session_state()
+        print("[*] Database and spectral features reset complete")
 
 
 def main():
     """Main entry point."""
-    
+
     detector = VectorDBSpeakerDetector(
-        similarity_threshold=0.8,      # Balanced threshold
-        min_speech_duration=2.0,        # Faster detection (reduced from 3.0s)
-        vad_threshold=0.5,              # More sensitive VAD
+        similarity_threshold=0.7,       # Balanced threshold for fused scoring
+        min_speech_duration=2.0,        # Faster detection
+        vad_threshold=0.5,              # Sensitive VAD
         device='cpu',
         db_path='./speaker_vectordb',
-        use_fft=True,                   # FFT enabled for accuracy
-        fft_weight=0.25                  # 20% weight for FFT features
+        use_fft=True,                   # Enable spectral features
+        fft_weight=0.20,                # Legacy FFT weight parameter
+        nn_weight=0.60,                 # 60% neural network embedding
+        spectral_fft_weight=0.20,       # 20% FFT spectral features
+        spectral_mfcc_weight=0.20,      # 20% MFCC spectral features
+        min_audio_energy=0.005,         # Audio quality gate: min RMS
+        min_snr_db=5.0,                 # Audio quality gate: min SNR
+        centroid_update_threshold=0.55, # Only update profile on high-confidence matches
+        min_enrollment_samples=3        # Require at least 3 enrollment samples
     )
-    
+
     while True:
         fft_status = "ON" if detector.use_fft else "OFF"
         print("\n" + "="*70)
-        print("SPEAKER DETECTION WITH VECTOR DATABASE + FFT")
-        print(f"FFT Features: {fft_status} (weight: {detector.fft_weight:.0%})")
+        print("SPEAKER DETECTION WITH MULTI-FEATURE FUSION")
+        print(f"Spectral Features: {fft_status} | Fusion: NN={detector.nn_weight:.0%} "
+              f"FFT={detector.spectral_fft_weight:.0%} MFCC={detector.spectral_mfcc_weight:.0%}")
         print("="*70)
         print("\nOptions:")
         print("1. Start Continuous Detection")
