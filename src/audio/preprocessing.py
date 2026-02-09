@@ -5,6 +5,9 @@ Handles format conversion, resampling, normalization, and enhancement.
 """
 
 import io
+import struct
+import subprocess
+import tempfile
 from pathlib import Path
 from typing import BinaryIO, Optional, Tuple, Union
 
@@ -56,6 +59,8 @@ class AudioPreprocessor:
         """
         Load audio from various sources and convert to numpy array.
 
+        Supports WAV, FLAC, OGG, MP3, WebM, and other formats via ffmpeg fallback.
+
         Args:
             audio_input: Audio file path, bytes, or file-like object
             target_sr: Target sample rate (uses default if None)
@@ -64,9 +69,11 @@ class AudioPreprocessor:
             Tuple of (audio_array, sample_rate)
         """
         target_sr = target_sr or self.target_sample_rate
+        soundfile_error = None
+        pydub_error = None
 
+        # Try soundfile first (fastest for supported formats)
         try:
-            # Handle different input types
             if isinstance(audio_input, (str, Path)):
                 audio, sr = sf.read(str(audio_input), dtype="float32")
             elif isinstance(audio_input, bytes):
@@ -86,8 +93,118 @@ class AudioPreprocessor:
             return audio.astype(np.float32), sr
 
         except Exception as e:
-            logger.error("audio_load_error", error=str(e))
-            raise AudioLoadError(f"Failed to load audio: {e}") from e
+            soundfile_error = str(e)
+            logger.debug("soundfile_failed", error=soundfile_error)
+
+        # Try pydub as fallback (handles more formats via ffmpeg)
+        try:
+            audio, sr = self._load_with_pydub(audio_input, target_sr)
+            return audio, sr
+        except Exception as e:
+            pydub_error = str(e)
+            logger.debug("pydub_failed", error=pydub_error)
+
+        # Try direct ffmpeg as last resort
+        try:
+            audio, sr = self._load_with_ffmpeg(audio_input, target_sr)
+            return audio, sr
+        except Exception as e:
+            logger.error("all_audio_loaders_failed",
+                        soundfile_error=soundfile_error,
+                        pydub_error=pydub_error,
+                        ffmpeg_error=str(e))
+            raise AudioLoadError(
+                f"Unsupported audio format. "
+                f"soundfile error: {soundfile_error}, "
+                f"pydub error: {pydub_error}"
+            ) from e
+
+    def _load_with_pydub(
+        self,
+        audio_input: Union[str, Path, bytes, BinaryIO],
+        target_sr: int,
+    ) -> Tuple[np.ndarray, int]:
+        """Load audio using pydub (requires ffmpeg)."""
+        from pydub import AudioSegment
+
+        if isinstance(audio_input, (str, Path)):
+            audio_segment = AudioSegment.from_file(str(audio_input))
+        elif isinstance(audio_input, bytes):
+            audio_segment = AudioSegment.from_file(io.BytesIO(audio_input))
+        else:
+            audio_segment = AudioSegment.from_file(audio_input)
+
+        # Convert to mono
+        if audio_segment.channels > 1:
+            audio_segment = audio_segment.set_channels(1)
+
+        # Resample if needed
+        if audio_segment.frame_rate != target_sr:
+            audio_segment = audio_segment.set_frame_rate(target_sr)
+
+        # Convert to numpy array
+        samples = np.array(audio_segment.get_array_of_samples())
+
+        # Normalize to float32 [-1, 1]
+        if audio_segment.sample_width == 1:
+            samples = samples.astype(np.float32) / 128.0 - 1.0
+        elif audio_segment.sample_width == 2:
+            samples = samples.astype(np.float32) / 32768.0
+        elif audio_segment.sample_width == 4:
+            samples = samples.astype(np.float32) / 2147483648.0
+        else:
+            samples = samples.astype(np.float32)
+
+        return samples, target_sr
+
+    def _load_with_ffmpeg(
+        self,
+        audio_input: Union[str, Path, bytes, BinaryIO],
+        target_sr: int,
+    ) -> Tuple[np.ndarray, int]:
+        """Load audio directly using ffmpeg subprocess."""
+        with tempfile.NamedTemporaryFile(suffix=".raw", delete=True) as tmp_out:
+            if isinstance(audio_input, bytes):
+                with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as tmp_in:
+                    tmp_in.write(audio_input)
+                    tmp_in.flush()
+                    input_path = tmp_in.name
+            elif isinstance(audio_input, (str, Path)):
+                input_path = str(audio_input)
+            else:
+                # Read from file-like object
+                with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as tmp_in:
+                    tmp_in.write(audio_input.read())
+                    tmp_in.flush()
+                    input_path = tmp_in.name
+
+            # Run ffmpeg to convert to raw PCM
+            cmd = [
+                "ffmpeg", "-y", "-i", input_path,
+                "-f", "f32le",  # 32-bit float little-endian
+                "-acodec", "pcm_f32le",
+                "-ac", "1",  # mono
+                "-ar", str(target_sr),  # target sample rate
+                tmp_out.name
+            ]
+
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                timeout=30,
+            )
+
+            if result.returncode != 0:
+                raise AudioLoadError(f"ffmpeg failed: {result.stderr.decode()}")
+
+            # Read raw PCM data
+            with open(tmp_out.name, "rb") as f:
+                raw_data = f.read()
+
+            # Convert to numpy array (float32)
+            audio = np.frombuffer(raw_data, dtype=np.float32)
+
+            return audio, target_sr
 
     def _resample(
         self, audio: np.ndarray, orig_sr: int, target_sr: int
