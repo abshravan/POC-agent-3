@@ -6,10 +6,12 @@ Main entry point for the REST API.
 
 from contextlib import asynccontextmanager
 from datetime import datetime
+from pathlib import Path
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
 
 from config.settings import get_settings
 from config.logging_config import setup_logging, get_logger
@@ -87,6 +89,11 @@ def create_app() -> FastAPI:
     app.include_router(speakers_router, prefix=settings.api_prefix)
     app.include_router(admin_router, prefix=settings.api_prefix)
 
+    # Mount static files
+    static_dir = Path(__file__).parent.parent / "static"
+    if static_dir.exists():
+        app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
+
     # Health check endpoint
     @app.get(
         "/health",
@@ -102,10 +109,13 @@ def create_app() -> FastAPI:
             timestamp=datetime.utcnow(),
         )
 
-    # Root endpoint
-    @app.get("/", tags=["root"])
+    # Root endpoint - serve UI
+    @app.get("/", tags=["root"], include_in_schema=False)
     async def root():
-        """Root endpoint with API information."""
+        """Serve the web UI."""
+        index_file = static_dir / "index.html"
+        if index_file.exists():
+            return FileResponse(str(index_file))
         return {
             "name": settings.app_name,
             "version": settings.app_version,

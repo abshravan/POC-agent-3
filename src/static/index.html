@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Speaker Identification System</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+    <header class="header">
+        <h1>SPEAKER IDENTIFICATION SYSTEM</h1>
+        <div class="header-status">
+            <span class="status-dot" id="statusDot"></span>
+            <span id="statusText">Connecting...</span>
+        </div>
+    </header>
+
+    <div class="container">
+        <nav class="nav-tabs">
+            <button class="nav-tab active" data-tab="identify">Identify</button>
+            <button class="nav-tab" data-tab="enroll">Enroll</button>
+            <button class="nav-tab" data-tab="speakers">Speakers</button>
+            <button class="nav-tab" data-tab="settings">Settings</button>
+        </nav>
+
+        <!-- Identify Tab -->
+        <div class="tab-content active" id="identify">
+            <div class="grid grid-2">
+                <div class="card">
+                    <div class="card-header">Real-time Identification</div>
+                    <div class="audio-recorder">
+                        <button class="record-btn" id="recordBtn">
+                            <div class="icon"></div>
+                        </button>
+                        <p id="recordStatus">Click to start recording</p>
+                    </div>
+                    <div class="audio-visualizer" id="visualizer">
+                        <!-- Visualizer bars will be added by JS -->
+                    </div>
+                    <div class="threshold-control">
+                        <label>Threshold:</label>
+                        <input type="range" class="threshold-slider" id="thresholdSlider"
+                               min="0" max="100" value="55">
+                        <span class="threshold-value" id="thresholdValue">0.55</span>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <div class="card-header">Result</div>
+                    <div id="identifyResult">
+                        <div class="result-box">
+                            <p style="color: var(--text-secondary); text-align: center;">
+                                Record audio to identify speaker
+                            </p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-header">Upload Audio File</div>
+                <div class="file-upload" id="identifyUpload">
+                    <p>Drop audio file here or click to upload</p>
+                    <input type="file" id="identifyFile" accept="audio/*" style="display: none;">
+                </div>
+                <button class="btn btn-primary" id="identifyFileBtn" style="margin-top: 1rem;" disabled>
+                    Identify from File
+                </button>
+            </div>
+        </div>
+
+        <!-- Enroll Tab -->
+        <div class="tab-content" id="enroll">
+            <div class="card">
+                <div class="card-header">Enroll New Speaker</div>
+                <form id="enrollForm">
+                    <div class="grid grid-2">
+                        <div class="form-group">
+                            <label for="employeeId">Employee ID *</label>
+                            <input type="text" class="form-control" id="employeeId" required>
+                        </div>
+                        <div class="form-group">
+                            <label for="speakerName">Name *</label>
+                            <input type="text" class="form-control" id="speakerName" required>
+                        </div>
+                    </div>
+                    <div class="form-group">
+                        <label for="department">Department</label>
+                        <input type="text" class="form-control" id="department">
+                    </div>
+                    <div class="form-group">
+                        <label>Audio Samples (minimum 3) *</label>
+                        <div class="file-upload" id="enrollUpload">
+                            <p>Drop audio files here or click to upload</p>
+                            <input type="file" id="enrollFiles" accept="audio/*" multiple style="display: none;">
+                        </div>
+                        <div class="file-list" id="enrollFileList"></div>
+                    </div>
+                    <button type="submit" class="btn btn-primary" id="enrollBtn">Enroll Speaker</button>
+                </form>
+                <div id="enrollResult" style="margin-top: 1rem;"></div>
+            </div>
+        </div>
+
+        <!-- Speakers Tab -->
+        <div class="tab-content" id="speakers">
+            <div class="grid grid-3">
+                <div class="stat-card">
+                    <div class="stat-value" id="totalSpeakers">0</div>
+                    <div class="stat-label">Total Speakers</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value" id="activeSpeakers">0</div>
+                    <div class="stat-label">Active Speakers</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value" id="totalEmbeddings">0</div>
+                    <div class="stat-label">Total Embeddings</div>
+                </div>
+            </div>
+
+            <div class="card" style="margin-top: 1.5rem;">
+                <div class="card-header">
+                    Enrolled Speakers
+                    <button class="btn btn-secondary" id="refreshSpeakers" style="float: right; padding: 0.25rem 0.75rem;">
+                        Refresh
+                    </button>
+                </div>
+                <div class="form-group">
+                    <input type="text" class="form-control" id="searchSpeakers" placeholder="Search speakers...">
+                </div>
+                <table class="table">
+                    <thead>
+                        <tr>
+                            <th>Name</th>
+                            <th>Employee ID</th>
+                            <th>Department</th>
+                            <th>Samples</th>
+                            <th>Enrolled</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody id="speakersList">
+                        <tr>
+                            <td colspan="6" style="text-align: center; color: var(--text-secondary);">
+                                Loading speakers...
+                            </td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- Settings Tab -->
+        <div class="tab-content" id="settings">
+            <div class="card">
+                <div class="card-header">Threshold Configuration</div>
+                <div class="form-group">
+                    <label>Identification Threshold</label>
+                    <div class="threshold-control">
+                        <input type="range" class="threshold-slider" id="globalThreshold"
+                               min="0" max="100" value="55">
+                        <span class="threshold-value" id="globalThresholdValue">0.55</span>
+                    </div>
+                    <small style="color: var(--text-secondary);">
+                        Higher values require more confidence for identification
+                    </small>
+                </div>
+                <button class="btn btn-primary" id="saveThreshold">Save Threshold</button>
+            </div>
+
+            <div class="card">
+                <div class="card-header">System Information</div>
+                <table class="table">
+                    <tbody id="systemInfo">
+                        <tr><td>Model</td><td id="infoModel">-</td></tr>
+                        <tr><td>Device</td><td id="infoDevice">-</td></tr>
+                        <tr><td>Embedding Dimension</td><td id="infoDimension">-</td></tr>
+                        <tr><td>API Version</td><td id="infoVersion">-</td></tr>
+                    </tbody>
+                </table>
+            </div>
+
+            <div class="card">
+                <div class="card-header">Cache Management</div>
+                <p style="margin-bottom: 1rem; color: var(--text-secondary);">
+                    Clear the embedding cache to free memory.
+                </p>
+                <button class="btn btn-secondary" id="clearCache">Clear Cache</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="/static/js/app.js"></script>
+</body>
+</html>
