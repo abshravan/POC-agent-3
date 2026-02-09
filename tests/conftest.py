@@ -4,7 +4,11 @@ Pytest fixtures for speaker identification tests.
 
 import numpy as np
 import pytest
+import pytest_asyncio
 from fastapi.testclient import TestClient
+
+# Configure pytest-asyncio mode
+pytest_plugins = ["pytest_asyncio"]
 
 
 @pytest.fixture
