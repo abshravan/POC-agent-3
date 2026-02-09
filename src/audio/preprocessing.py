@@ -109,15 +109,60 @@ class AudioPreprocessor:
             audio, sr = self._load_with_ffmpeg(audio_input, target_sr)
             return audio, sr
         except Exception as e:
+            ffmpeg_error = str(e)
+            logger.debug("ffmpeg_failed", error=ffmpeg_error)
+
+        # Last resort: try to interpret as raw PCM
+        try:
+            audio, sr = self._load_as_raw_pcm(audio_input, target_sr)
+            return audio, sr
+        except Exception as e:
             logger.error("all_audio_loaders_failed",
                         soundfile_error=soundfile_error,
                         pydub_error=pydub_error,
-                        ffmpeg_error=str(e))
+                        ffmpeg_error=ffmpeg_error,
+                        raw_pcm_error=str(e))
             raise AudioLoadError(
                 f"Unsupported audio format. "
                 f"soundfile error: {soundfile_error}, "
                 f"pydub error: {pydub_error}"
             ) from e
+
+    def _load_as_raw_pcm(
+        self,
+        audio_input: Union[str, Path, bytes, BinaryIO],
+        target_sr: int,
+    ) -> Tuple[np.ndarray, int]:
+        """Try to load as raw PCM data (last resort for browser audio)."""
+        if isinstance(audio_input, bytes):
+            data = audio_input
+        elif isinstance(audio_input, (str, Path)):
+            with open(str(audio_input), "rb") as f:
+                data = f.read()
+        else:
+            data = audio_input.read()
+
+        # Try float32 first (Web Audio API format)
+        if len(data) % 4 == 0:
+            try:
+                audio = np.frombuffer(data, dtype=np.float32)
+                if np.all(np.abs(audio) <= 1.5):  # Valid float audio range
+                    logger.info("loaded_as_raw_float32", samples=len(audio))
+                    return audio, target_sr
+            except Exception:
+                pass
+
+        # Try int16 (common PCM format)
+        if len(data) % 2 == 0:
+            try:
+                audio = np.frombuffer(data, dtype=np.int16)
+                audio = audio.astype(np.float32) / 32768.0
+                logger.info("loaded_as_raw_int16", samples=len(audio))
+                return audio, target_sr
+            except Exception:
+                pass
+
+        raise AudioLoadError("Could not interpret as raw PCM")
 
     def _load_with_pydub(
         self,
@@ -125,14 +170,43 @@ class AudioPreprocessor:
         target_sr: int,
     ) -> Tuple[np.ndarray, int]:
         """Load audio using pydub (requires ffmpeg)."""
+        import os
         from pydub import AudioSegment
 
         if isinstance(audio_input, (str, Path)):
             audio_segment = AudioSegment.from_file(str(audio_input))
         elif isinstance(audio_input, bytes):
-            audio_segment = AudioSegment.from_file(io.BytesIO(audio_input))
+            # Write to temp file so ffmpeg can detect format from extension
+            # Try multiple formats
+            audio_segment = None
+            last_error = None
+            for ext in [".webm", ".ogg", ".wav", ".mp3"]:
+                try:
+                    with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
+                        tmp.write(audio_input)
+                        tmp.flush()
+                        tmp_path = tmp.name
+                    try:
+                        audio_segment = AudioSegment.from_file(tmp_path)
+                        break
+                    finally:
+                        os.unlink(tmp_path)
+                except Exception as e:
+                    last_error = e
+                    continue
+            if audio_segment is None:
+                raise last_error or AudioLoadError("Failed to load audio with pydub")
         else:
-            audio_segment = AudioSegment.from_file(audio_input)
+            # Read from file-like object
+            data = audio_input.read()
+            with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as tmp:
+                tmp.write(data)
+                tmp.flush()
+                tmp_path = tmp.name
+            try:
+                audio_segment = AudioSegment.from_file(tmp_path)
+            finally:
+                os.unlink(tmp_path)
 
         # Convert to mono
         if audio_segment.channels > 1:
